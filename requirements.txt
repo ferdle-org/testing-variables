@@ -12,7 +12,6 @@ boto3==1.26.72
       python-dateutil==2.8.2
         six==1.16.0
       urllib3==1.26.19
-coverage==7.0.3
 django-cors-headers==3.13.0
   Django==4.2.16
     asgiref==3.6.0
