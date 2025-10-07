@@ -1,0 +1,159 @@
+name: Test Variables
+
+on:
+  push:
+    branches: [ 'playground' ]
+
+permissions:
+  id-token: write
+  contents: write
+
+jobs:
+  deploy:
+    name: Deploy via SSM
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+      - name: Write GitHub event to file
+        run: |
+          #!/bin/bash
+          
+          set -e  # Exit on any error
+          
+          # First write the GitHub event to payload.json
+          cat << EOF > payload.json
+          ${{ toJSON(github.event) }}
+          EOF
+          
+          echo "Initial GitHub event payload written to payload.json"
+          
+          # Fetch git history to ensure we can compare commits
+          echo "Fetching git history..."
+          if ! git fetch --prune --unshallow 2>/dev/null; then
+              echo "Warning: Could not fetch full git history, continuing with available history"
+          fi
+          
+          # Validate commit hashes exist
+          BEFORE="${{ github.event.before }}"
+          AFTER="${{ github.event.after }}"
+          
+          echo "Checking if commits exist: $BEFORE and $AFTER"
+          
+          if ! git rev-parse --verify "$BEFORE" >/dev/null 2>&1; then
+              echo "Error: Before commit $BEFORE does not exist"
+              exit 1
+          fi
+          
+          if ! git rev-parse --verify "$AFTER" >/dev/null 2>&1; then
+              echo "Error: After commit $AFTER does not exist"  
+              exit 1
+          fi
+          
+          echo "Getting detailed file changes between $BEFORE and $AFTER..."
+          
+          # Helper function to safely convert git output to JSON array
+          # This handles filenames with spaces correctly
+          git_output_to_json() {
+              local filter="$1"
+              local field_num="$2"
+              
+              # Use git diff with -z flag for null-terminated output, safer for filenames with spaces
+              git diff --name-status --diff-filter="$filter" -z "$BEFORE" "$AFTER" 2>/dev/null | \
+              if [ "$field_num" = "2" ]; then
+                  # For single field (added, modified, deleted files)
+                  cut -d$'\t' -f2 -z | tr '\0' '\n' | sed '/^$/d' | jq -R -s -c 'split("\n") | map(select(length > 0))'
+              else
+                  # For renamed files (need both old and new names)
+                  while IFS=$'\t' read -r -d '' status old_name new_name rest; do
+                      if [ -n "$old_name" ] && [ -n "$new_name" ]; then
+                          echo "$old_name -> $new_name"
+                      fi
+                  done | jq -R -s -c 'split("\n") | map(select(length > 0))'
+              fi
+          }
+          
+          # Alternative approach using git diff --name-status without -z (your original approach but fixed)
+          git_output_to_json_simple() {
+              local filter="$1"
+              local output
+              
+              output=$(git diff --name-status --diff-filter="$filter" "$BEFORE" "$AFTER" 2>/dev/null || echo "")
+              
+              if [ "$filter" = "R" ]; then
+                  # For renamed files, we need to handle the format differently
+                  echo "$output" | while read -r line; do
+                      if [ -n "$line" ]; then
+                          # Split on tab, get fields 2 and 3
+                          old_file=$(echo "$line" | cut -d$'\t' -f2)
+                          new_file=$(echo "$line" | cut -d$'\t' -f3)
+                          echo "$old_file -> $new_file"
+                      fi
+                  done | jq -R -s -c 'split("\n") | map(select(length > 0))'
+              else
+                  # For other file types, just get the filename (field 2)
+                  echo "$output" | cut -d$'\t' -f2 | sed '/^$/d' | jq -R -s -c 'split("\n") | map(select(length > 0))'
+              fi
+          }
+          
+          # Get file changes using the improved function
+          echo "Getting added files..."
+          ADDED_FILES=$(git_output_to_json_simple "A" || echo '[]')
+          
+          echo "Getting modified files..."
+          MODIFIED_FILES=$(git_output_to_json_simple "M" || echo '[]')
+          
+          echo "Getting deleted files..."
+          DELETED_FILES=$(git_output_to_json_simple "D" || echo '[]')
+          
+          echo "Getting renamed files..."
+          RENAMED_FILES=$(git_output_to_json_simple "R" || echo '[]')
+          
+          echo "Added files: $ADDED_FILES"
+          echo "Modified files: $MODIFIED_FILES" 
+          echo "Deleted files: $DELETED_FILES"
+          echo "Renamed files: $RENAMED_FILES"
+          
+          # Validate that all variables contain valid JSON arrays
+          for var_name in ADDED_FILES MODIFIED_FILES DELETED_FILES RENAMED_FILES; do
+              var_value=$(eval echo \$$var_name)
+              if ! echo "$var_value" | jq . >/dev/null 2>&1; then
+                  echo "Error: $var_name contains invalid JSON: $var_value"
+                  eval "$var_name='[]'"  # Set to empty array as fallback
+              fi
+          done
+          
+          # Add git changes to payload.json
+          echo "Adding file changes to payload..."
+          
+          # Read the current payload.json and validate it's valid JSON
+          if ! PAYLOAD=$(cat payload.json | jq . -c); then
+              echo "Error: payload.json contains invalid JSON"
+              exit 1
+          fi
+          
+          # Add git_changes field with detailed information
+          PAYLOAD=$(echo "$PAYLOAD" | jq \
+              --argjson added "$ADDED_FILES" \
+              --argjson modified "$MODIFIED_FILES" \
+              --argjson deleted "$DELETED_FILES" \
+              --argjson renamed "$RENAMED_FILES" \
+              '. + {
+                  "files_changed": {
+                      "added": $added,
+                      "modified": $modified,
+                      "removed": $deleted,
+                      "renamed": $renamed
+                  }
+              }')
+          
+          # Write the updated payload back to the file
+          echo "$PAYLOAD" > payload.json
+          
+          echo "Updated payload.json with file changes:"
+          echo "$PAYLOAD" | jq .
+          
+          echo "Script completed successfully!"
